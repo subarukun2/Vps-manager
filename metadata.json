@@ -1,0 +1,8 @@
+{
+  "name": "TeleVPS - Telegram VPS Manager",
+  "description": "Personal Heroku-like Telegram Bot and zero-effort setup script to deploy, manage, and monitor VPS applications directly from Telegram.",
+  "requestFramePermissions": [],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}

@@ -1,0 +1,10 @@
+node_modules/
+dist/
+logs/
+venv/
+.env
+*.log
+__pycache__/
+.DS_Store
+package-lock.json
+bun.lock

@@ -146,13 +146,24 @@ def detect_build_profile(repo_path):
                 profile["cmd"] = "npm start"
             
     # 3. Python detection
-    elif any((p / f).exists() for f in ["manage.py", "main.py", "app.py", "requirements.txt"]):
+    elif any((p / f).exists() for f in ["manage.py", "main.py", "app.py", "bot.py", "requirements.txt"]):
         profile["type"] = "python"
         if not profile["cmd"]:
-            if (p / "manage.py").exists(): profile["cmd"] = "python3 manage.py runserver 0.0.0.0:8000"
-            elif (p / "main.py").exists(): profile["cmd"] = "python3 main.py"
-            elif (p / "app.py").exists(): profile["cmd"] = "python3 app.py"
-            else: profile["cmd"] = "python3 manage.py runserver"
+            if (p / "manage.py").exists(): 
+                profile["cmd"] = "python3 manage.py runserver 0.0.0.0:8000"
+            elif (p / "bot.py").exists(): 
+                profile["cmd"] = "python3 bot.py"
+            elif (p / "main.py").exists(): 
+                profile["cmd"] = "python3 main.py"
+            elif (p / "app.py").exists(): 
+                profile["cmd"] = "python3 app.py"
+            else:
+                # If only requirements.txt exists, try to find ANY .py file
+                py_files = list(p.glob("*.py"))
+                if py_files:
+                    profile["cmd"] = f"python3 {py_files[0].name}"
+                else:
+                    profile["cmd"] = "python3 main.py" # Last resort
             
     return profile
 
@@ -350,21 +361,40 @@ async def app_info_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 @admin_only
 async def app_action_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """App actions."""
-    query = update.callback_query; await query.answer(); _, action, name = query.data.split(":")
-    if action == "restart": run_cmd(f"pm2 restart {name}")
+    """App actions with improved feedback."""
+    query = update.callback_query; await query.answer()
+    parts = query.data.split(":")
+    action = parts[1]
+    name = parts[2]
+    
+    if action == "restart":
+        await query.edit_message_text(f"⏳ *Restarting* `{name}`...", parse_mode=ParseMode.MARKDOWN)
+        run_cmd(f"pm2 restart {name}")
+        await asyncio.sleep(1.5)
     elif action == "toggle":
         res = subprocess.run(["pm2", "jlist"], capture_output=True, text=True)
         app = next((a for a in json.loads(res.stdout) if a['name'] == name), None)
-        run_cmd(f"pm2 stop {name}" if app['pm2_env']['status'] == 'online' else f"pm2 start {name}")
-    elif action == "delete": run_cmd(f"pm2 delete {name}"); return await manage_apps_handler(update, context)
+        if app:
+            cmd = "stop" if app['pm2_env']['status'] == 'online' else "start"
+            await query.edit_message_text(f"⏳ *{cmd.capitalize()}ing* `{name}`...", parse_mode=ParseMode.MARKDOWN)
+            run_cmd(f"pm2 {cmd} {name}")
+            await asyncio.sleep(1.5)
+    elif action == "delete": 
+        await query.edit_message_text(f"🗑 *Deleting* `{name}`...", parse_mode=ParseMode.MARKDOWN)
+        run_cmd(f"pm2 delete {name}")
+        run_cmd("pm2 save")
+        await asyncio.sleep(1)
+        return await manage_apps_handler(update, context)
     elif action == "logs":
         res = subprocess.run(["pm2", "logs", name, "--lines", "30", "--nostream"], capture_output=True, text=True)
         logs = html.escape((res.stdout + res.stderr)[-3500:])
-        await query.edit_message_text(f"📜 *Logs:* `{name}`\n<pre>{logs}</pre>", 
-                                      reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙", callback_data=f"app_info:{name}")]]) , parse_mode=ParseMode.HTML)
+        await query.edit_message_text(f"📜 *Logs:* `{name}`\n<pre>{logs or 'No logs found.'}</pre>", 
+                                      reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data=f"app_info:{name}")]]) , parse_mode=ParseMode.HTML)
         return
-    query.data = f"app_info:{name}"; await app_info_handler(update, context)
+
+    # Final refresh to show updated status
+    query.data = f"app_info:{name}"
+    await app_info_handler(update, context)
 
 @admin_only
 async def stats_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):

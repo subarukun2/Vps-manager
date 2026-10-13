@@ -148,7 +148,8 @@ async def start_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         [InlineKeyboardButton("📦 My Repositories", callback_data="list_repos")],
         [InlineKeyboardButton("🔗 Connect GitHub (PAT)", callback_data="connect_gh")],
         [InlineKeyboardButton("🚀 Manage Apps", callback_data="manage_apps")],
-        [InlineKeyboardButton("📊 System Stats", callback_data="stats")]
+        [InlineKeyboardButton("📊 System Stats", callback_data="stats")],
+        [InlineKeyboardButton("🛠 Advanced Tools", callback_data="advanced_menu")]
     ]
     
     text = (
@@ -307,9 +308,11 @@ async def manage_apps_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
 async def app_info_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Detailed app view."""
     query = update.callback_query; await query.answer(); name = query.data.split(":")[1]
-    res = subprocess.run(["pm2", "jlist"], capture_output=True, text=True)
-    app = next((a for a in json.loads(res.stdout) if a['name'] == name), None)
-    if not app: return
+    
+    app = await get_pm2_app_status(name)
+    if not app:
+        await query.edit_message_text(f"❌ *App `{name}` not found in PM2.*", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="manage_apps")]]), parse_mode=ParseMode.MARKDOWN)
+        return
     
     status = app['pm2_env']['status']
     mem = app['monit']['memory'] / (1024 * 1024)
@@ -324,7 +327,7 @@ async def app_info_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
          InlineKeyboardButton("⏹ Stop/Start", callback_data=f"app_act:toggle:{name}")],
         [InlineKeyboardButton("🔑 Config Vars", callback_data=f"app_vars:{name}")],
         [InlineKeyboardButton("📜 Logs", callback_data=f"app_act:logs:{name}"),
-         InlineKeyboardButton("🗑 Delete", callback_data=f"app_act:delete:{name}")],
+         InlineKeyboardButton("🗑 Delete", callback_data=f"app_act:delete_confirm:{name}")],
         [InlineKeyboardButton("🔙 Back", callback_data="manage_apps")]
     ]
     await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(kb), parse_mode=ParseMode.MARKDOWN)

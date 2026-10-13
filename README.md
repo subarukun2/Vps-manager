@@ -95,4 +95,4 @@ Feel free to fork this project and add more "Buildpacks" or features.
 This bot is designed for **personal use**. It includes an `ADMIN_ONLY` whitelist to ensure only you can control your VPS. Never share your `.env` file or Bot Token with anyone.
 
 ---
-*Created with ❤️ by TeleVPS Team*
+*Created with ❤️🌚

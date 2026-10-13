@@ -167,8 +167,22 @@ def detect_build_profile(repo_path):
             
     return profile
 
+async def run_async_cmd(cmd, cwd=None):
+    """Executes a shell command asynchronously and returns output + error."""
+    try:
+        process = await asyncio.create_subprocess_shell(
+            cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            cwd=cwd
+        )
+        stdout, stderr = await process.communicate()
+        return stdout.decode().strip(), stderr.decode().strip(), process.returncode
+    except Exception as e:
+        return "", str(e), 1
+
 def run_cmd(cmd, cwd=None):
-    """Executes a shell command and returns output + error."""
+    """Legacy blocking wrapper (if needed for non-async parts)."""
     try:
         res = subprocess.run(cmd, shell=True, capture_output=True, text=True, cwd=cwd, timeout=300)
         return res.stdout, res.stderr, res.returncode
@@ -361,34 +375,38 @@ async def app_info_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 @admin_only
 async def app_action_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """App actions with improved feedback."""
+    """App actions with async non-blocking feedback."""
     query = update.callback_query; await query.answer()
     parts = query.data.split(":")
     action = parts[1]
     name = parts[2]
     
     if action == "restart":
-        await query.edit_message_text(f"⏳ *Restarting* `{name}`...", parse_mode=ParseMode.MARKDOWN)
-        run_cmd(f"pm2 restart {name}")
-        await asyncio.sleep(1.5)
+        msg = await query.edit_message_text(f"⏳ *Restarting* `{name}`...", parse_mode=ParseMode.MARKDOWN)
+        await run_async_cmd(f"pm2 restart {name}")
+        await asyncio.sleep(2) # Give PM2 time to settle
     elif action == "toggle":
-        res = subprocess.run(["pm2", "jlist"], capture_output=True, text=True)
-        app = next((a for a in json.loads(res.stdout) if a['name'] == name), None)
+        app = get_pm2_app_status(name)
         if app:
             cmd = "stop" if app['pm2_env']['status'] == 'online' else "start"
-            await query.edit_message_text(f"⏳ *{cmd.capitalize()}ing* `{name}`...", parse_mode=ParseMode.MARKDOWN)
-            run_cmd(f"pm2 {cmd} {name}")
-            await asyncio.sleep(1.5)
-    elif action == "delete": 
+            msg = await query.edit_message_text(f"⏳ *{cmd.capitalize()}ing* `{name}`...", parse_mode=ParseMode.MARKDOWN)
+            await run_async_cmd(f"pm2 {cmd} {name}")
+            await asyncio.sleep(2)
+    elif action == "delete_confirm":
+        kb = [[InlineKeyboardButton("⚠️ Yes, Delete", callback_data=f"app_act:delete_final:{name}")], [InlineKeyboardButton("❌ Cancel", callback_data=f"app_info:{name}")]]
+        await query.edit_message_text(f"🗑 *Are you sure?*\nDeleting `{name}` will stop the process and remove it from PM2.", reply_markup=InlineKeyboardMarkup(kb), parse_mode=ParseMode.MARKDOWN)
+        return
+    elif action == "delete_final":
         await query.edit_message_text(f"🗑 *Deleting* `{name}`...", parse_mode=ParseMode.MARKDOWN)
-        run_cmd(f"pm2 delete {name}")
-        run_cmd("pm2 save")
+        await run_async_cmd(f"pm2 delete {name}")
+        await run_async_cmd("pm2 save")
         await asyncio.sleep(1)
         return await manage_apps_handler(update, context)
     elif action == "logs":
-        res = subprocess.run(["pm2", "logs", name, "--lines", "30", "--nostream"], capture_output=True, text=True)
-        logs = html.escape((res.stdout + res.stderr)[-3500:])
-        await query.edit_message_text(f"📜 *Logs:* `{name}`\n<pre>{logs or 'No logs found.'}</pre>", 
+        await query.edit_message_text(f"📜 *Fetching logs for* `{name}`...", parse_mode=ParseMode.MARKDOWN)
+        out, err, code = await run_async_cmd(f"pm2 logs {name} --lines 40 --nostream")
+        logs = html.escape((out + err)[-3800:])
+        await query.edit_message_text(f"📜 *Logs for* `{name}`:\n<pre>{logs or 'No logs found.'}</pre>", 
                                       reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data=f"app_info:{name}")]]) , parse_mode=ParseMode.HTML)
         return
 

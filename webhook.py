@@ -27,26 +27,36 @@ def notify_telegram(message: str):
         except Exception as e:
             print(f"Failed to send TG notification: {e}")
 
+from utils import detect_build_profile
+
 def run_auto_deploy(app_name: str, pusher_name: str, commit_hash: str, commit_msg: str):
     """Orchestrates git pull, dependency refresh, and PM2 restart."""
-    path = APPS_DIR / app_name
-    if not path.exists():
-        print(f"[!] Auto-deploy failed: {path} not found.")
+    repo_dir = APPS_DIR / app_name
+    if not repo_dir.exists():
+        print(f"[!] Auto-deploy failed: {repo_dir} not found.")
         return
     
     try:
         # 1. Pull latest code
-        subprocess.run(["git", "pull"], cwd=str(path), check=True)
+        subprocess.run(["git", "pull"], cwd=str(repo_dir), check=True)
         
-        # 2. Smart dependency refresh
-        if (path / "package.json").exists():
-            subprocess.run(["npm", "install", "--production"], cwd=str(path), check=True)
+        # 2. Re-detect profile (in case entry points changed)
+        profile = detect_build_profile(repo_dir)
+        app_root = Path(profile["app_root"])
+        
+        # 3. Smart dependency refresh in app_root
+        if profile["type"] == "nodejs":
+            subprocess.run(["npm", "install", "--production"], cwd=str(app_root), check=True)
             
-        if (path / "requirements.txt").exists():
-            pip_bin = str(path / "venv" / "bin" / "pip") if (path / "venv").exists() else "pip3"
-            subprocess.run([pip_bin, "install", "-r", "requirements.txt"], cwd=str(path), check=True)
+        elif profile["type"] == "python":
+            venv = app_root / "venv"
+            pip_bin = str(venv / "bin" / "pip") if venv.exists() else "pip3"
+            subprocess.run([pip_bin, "install", "-r", "requirements.txt"], cwd=str(app_root), check=True)
             
-        # 3. Reload PM2 process
+        # 4. Reload PM2 process
+        # We use 'restart' but PM2 preserves the original config (cwd, etc.)
+        # If we suspect the entry file moved, we might need a delete/start, 
+        # but for now restart is safer for auto-deploy.
         subprocess.run(["pm2", "restart", app_name], check=True)
         
         notify_telegram(

@@ -49,6 +49,8 @@ logger = logging.getLogger("TeleVPS")
 
 # --- Conversation States ---
 WAITING_GITHUB_TOKEN = 1
+WAITING_CONFIG_VAR = 2
+CURRENT_CONFIG_APP = "current_app" # Used in context.user_data
 
 # ------------------------------------------------------------------------------
 # SECURITY: ADMIN WHITELIST DECORATOR
@@ -74,98 +76,41 @@ def get_gh_client(context):
         return None
     return Github(token)
 
-def detect_build_profile(repo_path):
-    """
-    Strictly detects the app root folder following these safety rules:
-    1. Priority: Procfile > manage.py > package.json > main.py > bot.py.
-    2. Exclusion: Ignores system/dependency folders like .git, node_modules, venv, etc.
-    3. Depth: Prefers files closest to the root directory.
-    """
-    root = Path(repo_path)
-    priority_order = ["Procfile", "manage.py", "package.json", "main.py", "bot.py", "app.py", "requirements.txt"]
-    exclude_dirs = {".git", "node_modules", "venv", "env", "__pycache__", "dist", "build", ".next", ".cache"}
-    
-    best_match = None # (depth, priority_index, directory_path, filename)
+from utils import detect_build_profile
 
-    # Walk the directory tree
-    for dirpath, dirnames, filenames in os.walk(root):
-        # Rule 2: Prune junk folders to prevent searching inside them
-        dirnames[:] = [d for d in dirnames if d not in exclude_dirs]
-        
-        # Calculate current depth relative to repo root
-        current_dir = Path(dirpath)
-        depth = len(current_dir.relative_to(root).parts)
+async def get_pm2_app_status(name):
+    """Helper to get status of a single PM2 app."""
+    try:
+        out, err, code = await run_async_cmd("pm2 jlist")
+        apps = json.loads(out)
+        return next((a for a in apps if a['name'] == name), None)
+    except Exception as e:
+        logger.error(f"Error getting PM2 status for {name}: {e}")
+        return None
 
-        # Optimization: If we already found a match at a shallower depth, 
-        # and we are now looking deeper, we can stop because of Rule 3.
-        if best_match and depth > best_match[0]:
-            break
+@admin_only
+async def advanced_menu_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query; await query.answer()
+    kb = [
+        [InlineKeyboardButton("📋 Raw PM2 List", callback_data="pm2_raw_list")],
+        [InlineKeyboardButton("🧹 Flush All Logs", callback_data="clean_pm2_logs")],
+        [InlineKeyboardButton("🔙 Back", callback_data="back_main")]
+    ]
+    await query.edit_message_text("🛠 *Advanced Management*\nDirect control over PM2 and system logs.", reply_markup=InlineKeyboardMarkup(kb), parse_mode=ParseMode.MARKDOWN)
 
-        for fname in filenames:
-            if fname in priority_order:
-                p_idx = priority_order.index(fname)
-                
-                # Rule 1 & 3 logic:
-                # If this is the first match, or it's at the same depth but has higher priority
-                if best_match is None or p_idx < best_match[1]:
-                    best_match = (depth, p_idx, current_dir, fname)
-                    
-                    # Rule 1 Special: If we find a Procfile at this depth, it's the absolute winner for this level.
-                    if fname == "Procfile":
-                        break
-        
-        # If we found a Procfile at this level, we are strictly done according to Rule 1.
-        if best_match and best_match[3] == "Procfile":
-            break
+@admin_only
+async def raw_pm2_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query; await query.answer()
+    out, err, code = await run_async_cmd("pm2 list")
+    text = f"📋 *PM2 Process List:*\n<pre>{html.escape(out or 'No processes.')}</pre>"
+    kb = [[InlineKeyboardButton("🔙 Back", callback_data="advanced_menu")]]
+    await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(kb), parse_mode=ParseMode.HTML)
 
-    # Determine final app root and build profile
-    found_root = best_match[2] if best_match else root
-    p = found_root
-    profile = {"type": "unknown", "cmd": "", "app_root": str(found_root)}
-    
-    # 1. Procfile check
-    if (p / "Procfile").exists():
-        with open(p / "Procfile", "r") as f:
-            for line in f:
-                if line.strip().startswith("web:"):
-                    profile["cmd"] = line.replace("web:", "").strip()
-                    break
-
-    # 2. Node.js detection
-    if (p / "package.json").exists():
-        profile["type"] = "nodejs"
-        if not profile["cmd"]:
-            try:
-                with open(p / "package.json") as f:
-                    data = json.load(f)
-                    if "scripts" in data and "start" in data["scripts"]:
-                        profile["cmd"] = "npm start"
-                    else:
-                        profile["cmd"] = "node index.js"
-            except:
-                profile["cmd"] = "npm start"
-            
-    # 3. Python detection
-    elif any((p / f).exists() for f in ["manage.py", "main.py", "app.py", "bot.py", "requirements.txt"]):
-        profile["type"] = "python"
-        if not profile["cmd"]:
-            if (p / "manage.py").exists(): 
-                profile["cmd"] = "python3 manage.py runserver 0.0.0.0:8000"
-            elif (p / "bot.py").exists(): 
-                profile["cmd"] = "python3 bot.py"
-            elif (p / "main.py").exists(): 
-                profile["cmd"] = "python3 main.py"
-            elif (p / "app.py").exists(): 
-                profile["cmd"] = "python3 app.py"
-            else:
-                # If only requirements.txt exists, try to find ANY .py file
-                py_files = list(p.glob("*.py"))
-                if py_files:
-                    profile["cmd"] = f"python3 {py_files[0].name}"
-                else:
-                    profile["cmd"] = "python3 main.py" # Last resort
-            
-    return profile
+@admin_only
+async def clean_logs_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query; await query.answer("Flushing logs...")
+    await run_async_cmd("pm2 flush")
+    await query.edit_message_text("✅ *All PM2 logs have been cleared.*", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="advanced_menu")]]), parse_mode=ParseMode.MARKDOWN)
 
 async def run_async_cmd(cmd, cwd=None):
     """Executes a shell command asynchronously and returns output + error."""
@@ -288,9 +233,9 @@ async def deploy_repo_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
         # Step 1: Git Clone/Pull
         await status_msg.edit_text(f"🚀 *Deploying:* `{repo_full_name}`\n\n⚙️ *Status:* 📥 Cloning/Pulling code...", parse_mode=ParseMode.MARKDOWN)
         if repo_dir.exists():
-            out, err, code = run_cmd("git pull", cwd=str(repo_dir))
+            out, err, code = await run_async_cmd("git pull", cwd=str(repo_dir))
         else:
-            out, err, code = run_cmd(f"git clone {clone_url} {str(repo_dir)}")
+            out, err, code = await run_async_cmd(f"git clone {clone_url} {str(repo_dir)}")
         if code != 0: raise Exception(f"Git failed: {err or out}")
 
         # Step 2: Recursive Search for App Root
@@ -301,11 +246,11 @@ async def deploy_repo_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
         # Step 3: Install Dependencies
         await status_msg.edit_text(f"🚀 *Deploying:* `{repo_full_name}`\n\n⚙️ *Status:* 🛠 Installing dependencies in `{app_root.relative_to(repo_dir)}`...", parse_mode=ParseMode.MARKDOWN)
         if profile["type"] == "nodejs":
-            out, err, code = run_cmd("npm install --production", cwd=str(app_root))
+            out, err, code = await run_async_cmd("npm install --production", cwd=str(app_root))
         elif profile["type"] == "python":
             venv = app_root / "venv"
-            if not venv.exists(): run_cmd(f"python3 -m venv {str(venv)}", cwd=str(app_root))
-            out, err, code = run_cmd(f"{venv}/bin/pip install -r requirements.txt", cwd=str(app_root))
+            if not venv.exists(): await run_async_cmd(f"python3 -m venv {str(venv)}", cwd=str(app_root))
+            out, err, code = await run_async_cmd(f"{venv}/bin/pip install -r requirements.txt", cwd=str(app_root))
         if code != 0: raise Exception(f"Install failed: {err or out}")
 
         # Step 4: Webhook
@@ -322,13 +267,23 @@ async def deploy_repo_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
         if profile["type"] == "python" and cmd.startswith("python3"): 
             cmd = f"{app_root}/venv/bin/python " + cmd[8:]
         
-        run_cmd(f"pm2 delete {app_name}")
-        out, err, code = run_cmd(f"pm2 start \"{cmd}\" --name \"{app_name}\" --cwd \"{app_root}\"")
-        run_cmd("pm2 save")
+        await run_async_cmd(f"pm2 delete {app_name}")
+        out, err, code = await run_async_cmd(f"pm2 start \"{cmd}\" --name \"{app_name}\" --cwd \"{app_root}\"")
+        await run_async_cmd("pm2 save")
+        
         if code != 0: raise Exception(f"PM2 failed: {err or out}")
 
+        # Verification step: Wait 3 seconds and check if still online
+        await asyncio.sleep(3)
+        app_check = await get_pm2_app_status(app_name)
+        if not app_check or app_check['pm2_env']['status'] != 'online':
+            # It crashed! Fetch logs
+            l_out, l_err, _ = await run_async_cmd(f"pm2 logs {app_name} --lines 15 --nostream")
+            error_logs = html.escape((l_out + l_err)[-500:])
+            raise Exception(f"App started but crashed immediately.\n\n*Logs:*\n<pre>{error_logs}</pre>")
+
         await status_msg.edit_text(f"✅ *Deployment Successful!*\n\n📦 *App:* `{app_name}`\n📁 *Path:* `{app_root.relative_to(repo_dir)}/`\n⚙️ *Cmd:* `{profile['cmd']}`", 
-                                      reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🚀 Manage Apps", callback_data="manage_apps")]]), parse_mode=ParseMode.MARKDOWN)
+                                       reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🚀 Manage Apps", callback_data="manage_apps")]]), parse_mode=ParseMode.MARKDOWN)
     except Exception as e:
         await status_msg.edit_text(f"❌ *Failed:* `{str(e)[:500]}`", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Menu", callback_data="back_main")]]), parse_mode=ParseMode.MARKDOWN)
 
@@ -367,6 +322,7 @@ async def app_info_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     kb = [
         [InlineKeyboardButton("🔄 Restart", callback_data=f"app_act:restart:{name}"),
          InlineKeyboardButton("⏹ Stop/Start", callback_data=f"app_act:toggle:{name}")],
+        [InlineKeyboardButton("🔑 Config Vars", callback_data=f"app_vars:{name}")],
         [InlineKeyboardButton("📜 Logs", callback_data=f"app_act:logs:{name}"),
          InlineKeyboardButton("🗑 Delete", callback_data=f"app_act:delete:{name}")],
         [InlineKeyboardButton("🔙 Back", callback_data="manage_apps")]
@@ -386,9 +342,10 @@ async def app_action_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
         await run_async_cmd(f"pm2 restart {name}")
         await asyncio.sleep(2) # Give PM2 time to settle
     elif action == "toggle":
-        app = get_pm2_app_status(name)
+        app = await get_pm2_app_status(name)
         if app:
-            cmd = "stop" if app['pm2_env']['status'] == 'online' else "start"
+            current_status = app['pm2_env']['status']
+            cmd = "stop" if current_status == 'online' else "start"
             msg = await query.edit_message_text(f"⏳ *{cmd.capitalize()}ing* `{name}`...", parse_mode=ParseMode.MARKDOWN)
             await run_async_cmd(f"pm2 {cmd} {name}")
             await asyncio.sleep(2)
@@ -415,6 +372,164 @@ async def app_action_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
     await app_info_handler(update, context)
 
 @admin_only
+async def app_vars_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Lists environment variables for an app."""
+    query = update.callback_query; await query.answer()
+    name = query.data.split(":")[1]
+    env_file = APPS_DIR / name / ".env"
+    
+    vars_dict = {}
+    if env_file.exists():
+        with open(env_file, "r") as f:
+            for line in f:
+                if "=" in line and not line.startswith("#"):
+                    k, v = line.strip().split("=", 1)
+                    vars_dict[k] = v
+
+    text = f"🔑 *Config Vars:* `{name}`\n\n"
+    if vars_dict:
+        for k, v in vars_dict.items():
+            text += f"`{k}` = `{v}`\n"
+    else:
+        text += "_No variables set yet._"
+    
+    text += "\n\n💡 *Note:* Adding/Deleting a variable will automatically restart the app."
+
+    kb = [
+        [InlineKeyboardButton("➕ Add Variable", callback_data=f"add_var:{name}")],
+        [InlineKeyboardButton("🔍 Scan config.py", callback_data=f"import_cfg:{name}")],
+        [InlineKeyboardButton("🔙 Back to App", callback_data=f"app_info:{name}")]
+    ]
+    
+    # Add delete buttons for each var
+    for k in vars_dict:
+        kb.insert(-2, [InlineKeyboardButton(f"🗑 Delete {k}", callback_data=f"del_var:{name}:{k}")])
+
+    await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(kb), parse_mode=ParseMode.MARKDOWN)
+
+@admin_only
+async def import_config_py_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Scans config.py for variables and imports them into .env."""
+    query = update.callback_query; await query.answer()
+    name = query.data.split(":")[1]
+    app_dir = APPS_DIR / name
+    cfg_file = app_dir / "config.py"
+    env_file = app_dir / ".env"
+    
+    if not cfg_file.exists():
+        await query.answer("❌ config.py not found in app root.", show_alert=True)
+        return
+
+    import re
+    # Regex to find: CONSTANT = "value" or CONSTANT = 123
+    pattern = re.compile(r'^([A-Z_]+)\s*=\s*[\'"]?([^\'"]+)[\'"]?', re.MULTILINE)
+    
+    found_vars = {}
+    with open(cfg_file, "r") as f:
+        content = f.read()
+        matches = pattern.findall(content)
+        for k, v in matches:
+            if k not in ["LOGGER", "ENV"]: # Exclude some common non-config constants
+                found_vars[k] = v
+
+    if not found_vars:
+        await query.answer("ℹ️ No variables found in config.py to import.", show_alert=True)
+        return
+
+    # Merge into .env
+    existing_vars = {}
+    if env_file.exists():
+        with open(env_file, "r") as f:
+            for line in f:
+                if "=" in line:
+                    k, v = line.strip().split("=", 1)
+                    existing_vars[k] = v
+    
+    existing_vars.update(found_vars)
+    
+    with open(env_file, "w") as f:
+        for k, v in existing_vars.items():
+            f.write(f"{k}={v}\n")
+            
+    await query.edit_message_text(f"✅ *Imported {len(found_vars)} vars* from `config.py`!\n🚀 *Restarting* `{name}`...", parse_mode=ParseMode.MARKDOWN)
+    await run_async_cmd(f"pm2 restart {name}")
+    await asyncio.sleep(2)
+    
+    query.data = f"app_vars:{name}"
+    await app_vars_handler(update, context)
+
+@admin_only
+async def add_var_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Prompts for new config var."""
+    query = update.callback_query; await query.answer()
+    name = query.data.split(":")[1]
+    context.user_data[CURRENT_CONFIG_APP] = name
+    await query.edit_message_text(f"➕ *Add Config Var for* `{name}`\n\nPlease send the variable in `KEY=VALUE` format.\n\n_Example:_ `API_ID=1234567`", parse_mode=ParseMode.MARKDOWN)
+    return WAITING_CONFIG_VAR
+
+async def var_received(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Saves the new config var and restarts the app."""
+    text = update.message.text.strip()
+    name = context.user_data.get(CURRENT_CONFIG_APP)
+    
+    if "=" not in text or not name:
+        await update.message.reply_text("❌ *Invalid Format*\nPlease use `KEY=VALUE` format or type /cancel.")
+        return WAITING_CONFIG_VAR
+        
+    key, val = text.split("=", 1)
+    env_file = APPS_DIR / name / ".env"
+    
+    # Read existing
+    lines = []
+    found = False
+    if env_file.exists():
+        with open(env_file, "r") as f:
+            for line in f:
+                if line.startswith(f"{key}="):
+                    lines.append(f"{key}={val}\n")
+                    found = True
+                else:
+                    lines.append(line)
+    
+    if not found:
+        lines.append(f"{key}={val}\n")
+        
+    # Write back
+    with open(env_file, "w") as f:
+        f.writelines(lines)
+        
+    await update.message.reply_text(f"✅ *Saved:* `{key}`\n🚀 *Restarting* `{name}`...", parse_mode=ParseMode.MARKDOWN)
+    await run_async_cmd(f"pm2 restart {name}")
+    
+    # Return to app menu
+    context.user_data.pop(CURRENT_CONFIG_APP, None)
+    return ConversationHandler.END
+
+@admin_only
+async def delete_var_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Deletes a config var and restarts the app."""
+    query = update.callback_query; await query.answer()
+    _, name, key = query.data.split(":")
+    env_file = APPS_DIR / name / ".env"
+    
+    if env_file.exists():
+        lines = []
+        with open(env_file, "r") as f:
+            for line in f:
+                if not line.startswith(f"{key}="):
+                    lines.append(line)
+        
+        with open(env_file, "w") as f:
+            f.writelines(lines)
+            
+        await query.edit_message_text(f"🗑 *Deleted:* `{key}`\n🚀 *Restarting* `{name}`...", parse_mode=ParseMode.MARKDOWN)
+        await run_async_cmd(f"pm2 restart {name}")
+        await asyncio.sleep(1.5)
+        
+    query.data = f"app_vars:{name}"
+    await app_vars_handler(update, context)
+
+@admin_only
 async def stats_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """System telemetry."""
     query = update.callback_query; await query.answer()
@@ -429,14 +544,27 @@ def main():
     if not BOT_TOKEN: return
     app = ApplicationBuilder().token(BOT_TOKEN).build()
     gh_conv = ConversationHandler(
-        entry_points=[CallbackQueryHandler(connect_gh_start, pattern="^connect_gh$")],
-        states={WAITING_GITHUB_TOKEN: [MessageHandler(filters.TEXT & ~filters.COMMAND, token_received)]},
+        entry_points=[
+            CallbackQueryHandler(connect_gh_start, pattern="^connect_gh$"),
+            CallbackQueryHandler(add_var_start, pattern="^add_var:")
+        ],
+        states={
+            WAITING_GITHUB_TOKEN: [MessageHandler(filters.TEXT & ~filters.COMMAND, token_received)],
+            WAITING_CONFIG_VAR: [MessageHandler(filters.TEXT & ~filters.COMMAND, var_received)]
+        },
         fallbacks=[CommandHandler("cancel", lambda u, c: ConversationHandler.END)]
     )
+    
     app.add_handler(CommandHandler("start", start_handler))
     app.add_handler(gh_conv)
-    routing = [("^back_main$", start_handler), ("^list_repos$", list_repos_handler), ("^deploy:", deploy_repo_handler), 
-               ("^manage_apps$", manage_apps_handler), ("^app_info:", app_info_handler), ("^app_act:", app_action_handler), ("^stats$", stats_handler)]
+    
+    # Unified Pattern Routing
+    routing = [
+        ("^back_main$", start_handler), ("^list_repos$", list_repos_handler), ("^deploy:", deploy_repo_handler), 
+        ("^manage_apps$", manage_apps_handler), ("^app_info:", app_info_handler), ("^app_act:", app_action_handler), 
+        ("^stats$", stats_handler), ("^advanced_menu$", advanced_menu_handler), ("^pm2_raw_list$", raw_pm2_handler), 
+        ("^clean_pm2_logs$", clean_logs_handler), ("^app_vars:", app_vars_handler), ("^del_var:", delete_var_handler)
+    ]
     for pattern, handler in routing: app.add_handler(CallbackQueryHandler(handler, pattern=pattern))
     print("[*] TeleVPS Pro Booted.")
     app.run_polling()
